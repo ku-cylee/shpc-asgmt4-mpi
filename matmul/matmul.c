@@ -23,7 +23,6 @@ void matmul(float *A, float *B, float *C, int M, int N, int K,
     0, MPI_COMM_WORLD);
   MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-  __m512 a, b, c;
   __m512 *A_vecs = (__m512 *)aligned_alloc(32, M_per_rank * VEC_K * sizeof(__m512));
   __m512 *B_vecs = (__m512 *)aligned_alloc(32, VEC_K * N * sizeof(__m512));
 
@@ -37,35 +36,41 @@ void matmul(float *A, float *B, float *C, int M, int N, int K,
 
   #pragma omp parallel num_threads(threads_per_process) shared(j)
   {
-    #pragma omp for private(i, jj, k, kk, v, a, b, c)
+    #pragma omp for private(jj, k, v)
     for (j = 0; j < N; j += TILE_SIZE) {
-      for (jj = 0; jj < TILE_SIZE; jj++) {
+      for (jj = j; jj < j + TILE_SIZE; jj++) {
         for (k = 0; k < VEC_K; k++) {
           float b_[VECTOR_SIZE];
-          for (v = 0; v < VECTOR_SIZE; v++) b_[v] = B[(k * VECTOR_SIZE + v) * N + j + jj];
-          B_vecs[k * N + j + jj] = _mm512_load_ps(b_);
+          for (v = 0; v < VECTOR_SIZE; v++) b_[v] = B[(k * VECTOR_SIZE + v) * N + jj];
+          B_vecs[jj * VEC_K + k] = _mm512_load_ps(b_);
         }
       }
+    }
+  }
 
+  __m512 a, b, c;
+  #pragma omp parallel num_threads(threads_per_process) shared(j)
+  {
+    #pragma omp for private(i, jj, k, kk, a, b, c)
+    for (j = 0; j < N; j += TILE_SIZE) {
       for (k = 0; k < VEC_K; k += TILE_SIZE) {
         for (i = 0; i < M_per_rank; i++) {
-          for (jj = 0; jj < TILE_SIZE; jj++) {
+          for (jj = j; jj < j + TILE_SIZE; jj++) {
             c = _mm512_setzero_ps();
-            for (kk = 0; kk < TILE_SIZE; kk++) {
-              a = A_vecs[i * VEC_K + k + kk];
-              b = B_vecs[(k + kk) * N + j + jj];
+            for (kk = k; kk < k + TILE_SIZE; kk++) {
+              a = A_vecs[i * VEC_K + kk];
+              b = B_vecs[jj * VEC_K + kk];
               c = _mm512_fmadd_ps(a, b, c);
             }
-            C[(i + M_start) * N + j + jj] += _mm512_reduce_add_ps(c);
+            C[(i + M_start) * N + jj] += _mm512_reduce_add_ps(c);
           }
         }
       }
     }
   }
 
-  // Freeing A_vecs and B_vecs causes segmentation fault
-  // free(A_vecs);
-  // free(B_vecs);
+  free(A_vecs);
+  free(B_vecs);
 
   MPI_Gather(
     &C[M / mpi_world_size * mpi_rank * N], M * N / mpi_world_size, MPI_FLOAT,
